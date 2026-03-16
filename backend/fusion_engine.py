@@ -1,81 +1,106 @@
 """
-Fusion Engine — combines detector outputs into a single composite risk score.
+SentinelAI — fusion_engine.py
+Weighted risk aggregation with co-occurrence multiplier.
+
 Formula: R = Σ(wᵢ × scoreᵢ × confᵢ) × co_occurrence_multiplier
+Weights:  nlp=0.35, url=0.30, deepfake=0.20, anomaly=0.15
+Co-occurrence:
+    1.5× if nlp + url both trigger
+    1.8× if 3+ modules trigger
 """
 
-WEIGHTS = {
-    "nlp":      0.35,
-    "url":      0.30,
-    "deepfake": 0.20,
-    "anomaly":  0.15,
+from typing import Any
+
+# Module weights (must sum to 1.0)
+WEIGHTS: dict[str, float] = {
+    "nlp_detector": 0.35,
+    "url_detector": 0.30,
+    "deepfake_detector": 0.20,
+    "anomaly_detector": 0.15,
 }
 
+# Trigger threshold — score above this counts as "triggered"
+TRIGGER_THRESHOLD = 0.40
+
+# Severity bands
 SEVERITY_BANDS = [
-    (81, 100, "Critical"),
-    (61, 80,  "Likely Malicious"),
-    (31, 60,  "Suspicious"),
-    (0,  30,  "Clean"),
+    (80, "CRITICAL"),
+    (60, "HIGH"),
+    (40, "MEDIUM"),
+    (20, "LOW"),
+    (0,  "INFO"),
 ]
 
 
 class FusionEngine:
 
-    def fuse(self, detector_results: dict) -> dict:
+    def aggregate(self, detector_results: dict[str, Any]) -> dict:
         """
-        Accepts a dict of {detector_name: {score, confidence, ...}}
-        Returns composite risk score and severity band.
+        Accepts the orchestrator output dict and returns:
+        {
+            "risk_score": int (0-100),
+            "severity": str,
+            "active_detectors": list[str],
+            "raw_weighted_sum": float,
+            "multiplier": float,
+            "per_module": dict
+        }
         """
-        if not detector_results:
-            return {"risk_score": 0, "severity": "Clean", "active_detectors": []}
-
         weighted_sum = 0.0
-        total_weight = 0.0
-        active_detectors = []
+        per_module: dict[str, dict] = {}
+        active_detectors: list[str] = []
 
-        for name, result in detector_results.items():
-            if "error" in result:
-                continue
-            score = result.get("score", 0.0)
-            confidence = result.get("confidence", 1.0)
-            weight = WEIGHTS.get(name, 0.1)
+        for module, result in detector_results.items():
+            score = float(result.get("score", 0.0))
+            confidence = float(result.get("confidence", 0.0))
+            weight = WEIGHTS.get(module, 0.10)   # fallback weight for unknown modules
 
-            # Low-confidence predictions contribute at half weight
-            effective_confidence = confidence if confidence >= 0.6 else confidence * 0.5
+            contribution = weight * score * confidence
+            weighted_sum += contribution
 
-            weighted_sum += weight * score * effective_confidence
-            total_weight += weight
+            per_module[module] = {
+                "score": round(score, 4),
+                "confidence": round(confidence, 4),
+                "weight": weight,
+                "contribution": round(contribution, 4),
+                "triggered": score >= TRIGGER_THRESHOLD,
+            }
 
-            if score > 0.3:
-                active_detectors.append(name)
-
-        if total_weight == 0:
-            raw_score = 0.0
-        else:
-            raw_score = weighted_sum / total_weight
+            if score >= TRIGGER_THRESHOLD:
+                active_detectors.append(module)
 
         # Co-occurrence multiplier
         multiplier = self._co_occurrence_multiplier(active_detectors)
-        final_score = min(100, int(raw_score * 100 * multiplier))
 
-        severity = self._get_severity(final_score)
+        raw_risk = weighted_sum * multiplier
+        risk_score = min(100, int(round(raw_risk * 100)))
+
+        severity = self._severity(risk_score)
 
         return {
-            "risk_score": final_score,
+            "risk_score": risk_score,
             "severity": severity,
             "active_detectors": active_detectors,
-            "raw_weighted_score": round(raw_score, 4),
-            "co_occurrence_multiplier": multiplier,
+            "raw_weighted_sum": round(weighted_sum, 4),
+            "multiplier": multiplier,
+            "per_module": per_module,
         }
 
-    def _co_occurrence_multiplier(self, active: list) -> float:
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _co_occurrence_multiplier(active: list[str]) -> float:
+        nlp_on = "nlp_detector" in active
+        url_on = "url_detector" in active
         if len(active) >= 3:
             return 1.8
-        if "nlp" in active and "url" in active:
+        if nlp_on and url_on:
             return 1.5
         return 1.0
 
-    def _get_severity(self, score: int) -> str:
-        for lo, hi, label in SEVERITY_BANDS:
-            if lo <= score <= hi:
+    @staticmethod
+    def _severity(score: int) -> str:
+        for threshold, label in SEVERITY_BANDS:
+            if score >= threshold:
                 return label
-        return "Clean"
+        return "INFO"
