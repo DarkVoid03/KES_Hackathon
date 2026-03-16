@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+scikit-learn
+lightgbm
+torch
+transformers
+axios
+python-multipart
+python-dotenv
